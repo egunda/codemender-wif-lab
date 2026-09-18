@@ -1,0 +1,175 @@
+# =============================================================================
+# CodeMender CI/CD Guardrail: STARTER PIPELINE
+# =============================================================================
+name: CodeMender CI/CD Guardrail
+
+on:
+  push:
+    branches: [ "main" ]
+    paths-ignore: [ '**.md', 'lab/**', '.gitignore' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write          # push the remediation branch
+  pull-requests: write     # open the autonomous remediation PR
+  id-token: write          # required for Workload Identity Federation (WIF) OIDC token
+
+env:
+  SCAN_PATH: src/services
+  CM_BUNDLED: lab/bin/cm-linux
+  CM_MODEL: gemini-3.7-flash
+  CM_LIMIT: "1"
+
+jobs:
+  codemender-security:
+    name: Scan, Verify, and Patch
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Authenticate to Google Cloud (WIF / ADC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_EMAIL }}
+          project_id: ${{ vars.GCP_QUOTA_PROJECT }}
+
+      - name: Install CodeMender CLI (cm)
+        run: |
+          set -euo pipefail
+          sudo ln -sf /bin/bash /bin/sh
+          mkdir -p "$RUNNER_TEMP/cmbin"
+          install -m 0755 "$CM_BUNDLED" "$RUNNER_TEMP/cmbin/cm"
+          echo "$RUNNER_TEMP/cmbin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/cmbin/cm" --version
+
+      - name: Install Application Dependencies
+        run: npm install --no-audit --no-fund || true
+
+      - name: Initialize CodeMender Workspace
+        run: |
+          set -euo pipefail
+          cm init || true
+          CONFIG="$HOME/.codemender/config.yaml"
+          if ! grep -q '^project_paths:' "$CONFIG" 2>/dev/null; then
+            printf '\nproject_paths:\n  - "%s"\n' "$GITHUB_WORKSPACE" >> "$CONFIG"
+          fi
+          sed -i 's/type: ""/type: "git"/' "$CONFIG" 2>/dev/null || true
+          if ! grep -q 'type: "git"' "$CONFIG" 2>/dev/null && ! grep -q 'type: git' "$CONFIG" 2>/dev/null; then
+            printf '\nvcs:\n  type: git\n' >> "$CONFIG"
+          fi
+          echo "Sandbox scoped to: $GITHUB_WORKSPACE"
+
+      - name: CodeMender Scan
+        id: scan
+        run: |
+          cm find "$SCAN_PATH" -y --model "$CM_MODEL" 2>&1 | tee "$RUNNER_TEMP/cm-find.cm.log"
+
+      - name: Export Security Report
+        if: always()
+        run: |
+          cm report -f json > "$RUNNER_TEMP/cm-security-report.json" || true
+
+      - name: Triage Findings
+        id: triage
+        run: |
+          python3 .github/scripts/cm_triage.py "$RUNNER_TEMP/cm-security-report.json"
+
+      - name: Verify and Remediate
+        id: remediate
+        if: steps.triage.outputs.fix_ids != ''
+        run: |
+          set -uo pipefail
+          git config user.name "codemender-bot"
+          git config user.email "codemender-bot@users.noreply.github.com"
+          COUNT=0
+          FIXED=0
+          SKIPPED=0
+          for FID in ${{ steps.triage.outputs.fix_ids }}; do
+            if [ "$COUNT" -ge "$CM_LIMIT" ]; then break; fi
+            COUNT=$((COUNT+1))
+            echo "::group::Verify $FID"
+            cm verify "$FID" -y --bypass-warning --model "$CM_MODEL" \
+              2>&1 | tee "$RUNNER_TEMP/verify-$FID.cm.log" || true
+            cm report -f json > "$RUNNER_TEMP/verified-$FID.json" || true
+            echo "::endgroup::"
+            if ! python3 .github/scripts/cm_verdict.py \
+                 "$RUNNER_TEMP/verified-$FID.json" "$FID"; then
+              SKIPPED=$((SKIPPED+1))
+              continue
+            fi
+            echo "::group::Fix $FID"
+            cm fix "$FID" -y --bypass-warning --model "$CM_MODEL" 2>&1 | tee "$RUNNER_TEMP/fix-$FID.cm.log" || true
+            python3 .github/scripts/extract_cm_diff.py \
+              "$RUNNER_TEMP/fix-$FID.cm.log" > "$RUNNER_TEMP/fix-$FID.patch" || true
+            if [ -s "$RUNNER_TEMP/fix-$FID.patch" ]; then
+              if git apply --check -p1 "$RUNNER_TEMP/fix-$FID.patch" 2>/dev/null; then
+                git apply -p1 "$RUNNER_TEMP/fix-$FID.patch"
+              elif git apply --check -p1 --directory="$SCAN_PATH" "$RUNNER_TEMP/fix-$FID.patch" 2>/dev/null; then
+                git apply -p1 --directory="$SCAN_PATH" "$RUNNER_TEMP/fix-$FID.patch"
+              fi
+            fi
+            echo "::endgroup::"
+            if ! git diff --quiet; then
+              git add -A
+              git commit -q -m "fix(security): CodeMender remediation for $FID"
+              FIXED=$((FIXED+1))
+              echo "Committed fix for $FID"
+            else
+              echo "cm produced no file changes for $FID"
+            fi
+          done
+          echo "Considered $COUNT finding(s): $FIXED fixed, $SKIPPED dismissed."
+          echo "fixed=$FIXED" >> "$GITHUB_OUTPUT"
+          git --no-pager log --oneline "origin/main..HEAD" || true
+
+      - name: Open Remediation Pull Request
+        id: pr
+        if: steps.remediate.outputs.fixed != '0'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          base: main
+          branch: codemender/auto-remediation
+          delete-branch: true
+          commit-message: "fix(security): CodeMender autonomous remediation"
+          title: "CodeMender: autonomous security remediation"
+          body: "Auto-remediated HIGH/CRITICAL findings via cm verify + cm fix."
+
+      - name: Generate CodeMender HTML Report
+        if: always()
+        run: |
+          cm report -f html || true
+          if [ -f "$HOME/.codemender/reports/report.html" ]; then
+            cp "$HOME/.codemender/reports/report.html" "$RUNNER_TEMP/codemender-report.html"
+          fi
+
+      - name: Upload HTML Security Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codemender-html-report
+          path: ${{ runner.temp }}/codemender-report.html
+          if-no-files-found: ignore
+
+      - name: CodeMender Token Usage Stats
+        if: always()
+        run: |
+          cm stats </dev/null || true
+
+      - name: Security Gate
+        if: always()
+        run: |
+          FOUND="${{ steps.triage.outputs.high_critical }}"
+          PATCHED="${{ steps.remediate.outputs.fixed }}"
+          FOUND="${FOUND:-0}"
+          PATCHED="${PATCHED:-0}"
+          if [ "$FOUND" -gt 0 ]; then
+            echo "::error title=Deployment blocked::CodeMender found $FOUND HIGH/CRITICAL finding(s). $PATCHED proposed for remediation in the pull request, $((FOUND-PATCHED)) not yet addressed. Failing the pipeline."
+            exit 1
+          fi
+
